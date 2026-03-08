@@ -404,7 +404,7 @@ function getWebviewContent(): string {
         '<head>',
         '<meta charset="UTF-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src https://fonts.gstatic.com; script-src \'unsafe-inline\' https://cdnjs.cloudflare.com; img-src data:;">',
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src https://fonts.gstatic.com; script-src \'unsafe-inline\' https://cdnjs.cloudflare.com; img-src data:; media-src mediastream: blob: *;">',
         '<title>Dev-Saarathi</title>',
         "<style>@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap');</style>",
         '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>',
