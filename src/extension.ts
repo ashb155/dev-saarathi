@@ -127,6 +127,21 @@ function httpsGet(url: string): Promise<string> {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+async function pollWithBackoff(jobId: string, maxAttempts = 50): Promise<{
+    status: string; query?: string; response?: string; intent?: string;
+    detected_lang?: string; error?: string; agentic_file?: string;
+}> {
+    const getDelay = (attempt: number) => attempt < 6 ? 3000 : attempt < 12 ? 5000 : 8000;
+    for (let i = 0; i < maxAttempts; i++) {
+        await sleep(getDelay(i));
+        if (pollingAborted) { throw new Error('ABORTED'); }
+        const raw = await httpsGet(API_BASE + '/result/' + jobId);
+        const data = JSON.parse(raw);
+        if (data.status === 'COMPLETED' || data.status === 'FAILED') { return data; }
+    }
+    throw new Error('TIMEOUT');
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DevSaarathiViewProvider(context.extensionUri);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('devSaarathi.chatView', provider));
@@ -172,14 +187,25 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
     }
 }
 
+function extractCleanCode(content: string): string {
+    const firstFence = content.indexOf('```');
+    const afterOpen = firstFence > -1 ? firstFence + 3 : -1;
+    const closeFence = afterOpen > -1 ? content.indexOf('```', afterOpen) : -1;
+    let cleanCode = (afterOpen > -1 && closeFence > afterOpen)
+        ? content.substring(afterOpen, closeFence)
+        : content;
+    cleanCode = cleanCode.replace(/COPY$/gm, '');
+    cleanCode = cleanCode.replace(/^[a-zA-Z]+\n/, ''); 
+    cleanCode = cleanCode.replace(/^(?:python|javascript|js|typescript|ts|bash|java|go|rust|cpp|c|sql|html|css)(?=[a-zA-Z\/\-#])/, '');  // fused: "pythonfrom"
+    return cleanCode.trim();
+}
+
 async function executeAgenticAction(intent: string, content: string, agenticFile?: string) {
-    // ── VAANI — write new/updated code to file ─────────────────────────────────
     if (intent === 'VAANI' && agenticFile) {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
         const root = workspaceFolders[0].uri;
-        const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
-        const cleanCode = codeMatch ? codeMatch[1].trim() : content.trim();
+        const cleanCode = extractCleanCode(content);
         const fileUri = vscode.Uri.joinPath(root, agenticFile);
         let fileExists = false;
         try { await vscode.workspace.fs.stat(fileUri); fileExists = true; } catch { }
@@ -191,22 +217,26 @@ async function executeAgenticAction(intent: string, content: string, agenticFile
         return;
     }
 
-    // ── DOSH — write fixed code back to same file ──────────────────────────────
+
     if (intent === 'DOSH' && agenticFile) {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
         const root = workspaceFolders[0].uri;
-        const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
-        const cleanCode = codeMatch ? codeMatch[1].trim() : content.trim();
+        const cleanCode = extractCleanCode(content);
         const fileUri = vscode.Uri.joinPath(root, agenticFile);
-        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(cleanCode));
         const doc = await vscode.workspace.openTextDocument(fileUri);
         await vscode.window.showTextDocument(doc, { preview: false });
+        const fullRange = new vscode.Range(
+            doc.positionAt(0),
+            doc.positionAt(doc.getText().length)
+        );
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(fileUri, fullRange, cleanCode);
+        await vscode.workspace.applyEdit(edit);
         vscode.window.showInformationMessage('🔧 Dev-Saarathi applied fix to ' + agenticFile);
         return;
     }
 
-    // ── KARMA GIT — open terminal, paste commands, let developer review & run ──
     if (agenticFile === '__GIT__') {
         const terminal = vscode.window.createTerminal('Dev-Saarathi Git');
         terminal.show();
@@ -219,7 +249,7 @@ async function executeAgenticAction(intent: string, content: string, agenticFile
         return;
     }
 
-    // ── KARMA README / TESTS — write to file using agenticFile from processor ──
+
     if (agenticFile) {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
@@ -230,7 +260,6 @@ async function executeAgenticAction(intent: string, content: string, agenticFile
             const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
             cleanContent = codeMatch ? codeMatch[1].trim() : content.trim();
         } else {
-            // README — strip preamble before first heading
             const firstHeading = content.indexOf('\n#');
             cleanContent = firstHeading > 0 ? content.slice(firstHeading + 1).trim() : content.trim();
         }
@@ -240,6 +269,22 @@ async function executeAgenticAction(intent: string, content: string, agenticFile
         await vscode.window.showTextDocument(doc, { preview: false });
         vscode.window.showInformationMessage('✅ Dev-Saarathi created ' + agenticFile);
     }
+}
+
+function getActiveDiagnostics(): string {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { return ''; }
+    const uri = editor.document.uri;
+    const diags = vscode.languages.getDiagnostics(uri);
+    if (!diags || diags.length === 0) { return ''; }
+    const relevant = diags.filter(d => d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning);
+    if (relevant.length === 0) { return ''; }
+    const filename = path.basename(editor.document.fileName);
+    const lines = relevant.map(d => {
+        const severity = d.severity === vscode.DiagnosticSeverity.Error ? 'Error' : 'Warning';
+        return filename + ':' + (d.range.start.line + 1) + ':' + (d.range.start.character + 1) + ': ' + severity + ': ' + d.message;
+    });
+    return lines.join('\n');
 }
 
 async function handleRecording(webview: vscode.Webview, seconds: number) {
@@ -257,7 +302,10 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         if (workspaceContext) { body.code_context = workspaceContext; }
         else if (codeContext) { body.code_context = codeContext; }
         if (activeEditor) { body.active_filename = path.basename(activeEditor.document.fileName); }
-        // Trim context if payload is too large for Lambda async invoke (256KB limit)
+        const diagnostics = getActiveDiagnostics();
+        if (diagnostics && body.code_context) {
+            body.code_context = '### TERMINAL ERROR:\n```\n' + diagnostics + '\n```\n' + body.code_context;
+        }
         let bodyStr = JSON.stringify(body);
         if (bodyStr.length > 200000 && body.code_context) {
             body.code_context = body.code_context.substring(0, Math.max(1000, body.code_context.length - (bodyStr.length - 200000) - 200));
@@ -266,46 +314,42 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         const triggerRaw = await httpsPost(API_BASE + '/voice', bodyStr);
         const triggerData = JSON.parse(triggerRaw) as { job_id?: string; error?: string };
         if (!triggerData.job_id) { webview.postMessage({ command: 'error', text: triggerData.error || 'Failed to start job' }); return; }
+
         webview.postMessage({ command: 'status', text: 'Processing with Dev-Saarathi AI...' });
-        for (let i = 0; i < 60; i++) {
-            await sleep(3000);
-            if (pollingAborted) { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); return; }
-            const resultRaw = await httpsGet(API_BASE + '/result/' + triggerData.job_id);
-            const resultData = JSON.parse(resultRaw) as {
-                status: string;
-                query?: string;
-                response?: string;
-                intent?: string;
-                detected_lang?: string;
-                error?: string;
-                agentic_file?: string;
-                proposed_code?: string;
-            };
-            if (resultData.status === 'COMPLETED') {
-                const intent = resultData.intent || '';
-                // ── CHANGE 1: DOSH and KARMA now included, all gated on agentic_file ──
-                const isAgentic = !!(intent === 'VAANI' && resultData.agentic_file)
-                    || !!(intent === 'DOSH' && resultData.agentic_file)
-                    || !!(intent === 'KARMA' && resultData.agentic_file);
-                webview.postMessage({
-                    command: 'response',
-                    query: resultData.query,
-                    response: resultData.response,
-                    intent: intent,
-                    detected_lang: resultData.detected_lang,
-                    agentic: isAgentic,
-                    agentic_file: resultData.agentic_file || null
-                });
-                return;
-            } else if (resultData.status === 'FAILED') {
-                webview.postMessage({ command: 'error', text: resultData.error || 'Processing failed' }); return;
-            }
+
+        let resultData: { status: string; query?: string; response?: string; intent?: string; detected_lang?: string; error?: string; agentic_file?: string; };
+        try {
+            resultData = await pollWithBackoff(triggerData.job_id);
+        } catch (pollErr) {
+            const msg = String(pollErr);
+            if (msg === 'Error: ABORTED') { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); }
+            else if (msg === 'Error: TIMEOUT') { webview.postMessage({ command: 'error', text: 'Request timed out — please try again.' }); }
+            else { webview.postMessage({ command: 'error', text: msg }); }
+            return;
         }
-        webview.postMessage({ command: 'error', text: 'Request timed out' });
+
+        if (resultData.status === 'COMPLETED') {
+            const intent = resultData.intent || '';
+            const isAgentic = !!(intent === 'VAANI' && resultData.agentic_file)
+                || !!(intent === 'DOSH' && resultData.agentic_file)
+                || !!(intent === 'KARMA' && resultData.agentic_file);
+            webview.postMessage({
+                command: 'response',
+                query: resultData.query,
+                response: resultData.response,
+                intent: intent,
+                detected_lang: resultData.detected_lang,
+                agentic: isAgentic,
+                agentic_file: resultData.agentic_file || null
+            });
+        } else {
+            webview.postMessage({ command: 'error', text: resultData.error || 'Processing failed' });
+        }
+
     } catch (err) {
         const msg = String(err);
         if (msg.includes('SILENCE')) {
-            webview.postMessage({ command: 'error', text: '🤫 No audio detected — please speak clearly and try again!' });
+            webview.postMessage({ command: 'error', text: 'No audio detected — please speak clearly and try again!' });
         } else if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network|socket hang up/i.test(msg)) {
             webview.postMessage({ command: 'error', text: '🔌 Backend unavailable — check your internet connection and try again.' });
         } else {
@@ -421,6 +465,8 @@ function buildCSS(): string {
         '.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }',
         '@keyframes spin { to { transform: rotate(360deg); } }',
         '.error-msg { font-size: 11px; color: var(--dosh); padding: 8px 12px; background: rgba(253,121,168,0.08); border: 1px solid rgba(253,121,168,0.2); border-radius: 8px; }',
+        '.guardrail-warn { background: rgba(255,214,102,0.07); border: 1px solid rgba(255,214,102,0.3); border-left: 3px solid var(--accent2); border-radius: 8px; padding: 10px 14px; }',
+        '.guardrail-warn::before { content: "⚠️ कर्म-कवच — Request Blocked"; display: block; font-size: 9px; font-weight: 700; color: var(--accent2); letter-spacing: 1px; margin-bottom: 8px; text-transform: uppercase; }',
         '.action-bar { display: flex; gap: 6px; margin-top: 8px; }',
         '.action-label { font-size: 9px; color: var(--muted); margin-bottom: 4px; letter-spacing: 0.5px; }',
         '.btn-accept { flex: 1; padding: 7px; border-radius: 6px; background: rgba(78,205,196,0.15); color: var(--vaani); font-size: 10px; font-weight: 700; cursor: pointer; border: 1px solid rgba(78,205,196,0.3); transition: all 0.15s; }',
@@ -468,6 +514,12 @@ function buildJS(): string {
         '  var TICK = String.fromCharCode(96);',
         '  var FENCE = TICK+TICK+TICK;',
         '  text = text.replace(/([a-zA-Z]+)COPY`([^`]+)`/g, function(_, lang, code) { return FENCE + lang + "\\n" + code.trim() + "\\n" + FENCE; });',
+        '  // Strip bare COPY suffix appended to code lines',
+        '  text = text.replace(/COPY$/gm, "");',
+        '  // Strip ```markdown wrapper if LLM wraps entire response in a code fence',
+        '  var mdFence = new RegExp("^" + FENCE + "markdown\\\\n([\\\\s\\\\S]*?)\\\\n?" + FENCE + "$", "m");',
+        '  var mdMatch = text.trim().match(mdFence);',
+        '  if (mdMatch) { text = mdMatch[1]; }',
         '  return marked.parse(text);',
         '}',
         '',
@@ -539,6 +591,8 @@ function buildJS(): string {
         '}',
         '',
         'function addError(text) {',
+        '  removeStatus();',
+        '  if (!text) { resetBtn(); return; }',
         '  var el = document.createElement("div");',
         '  el.className = "error-msg";',
         '  el.textContent = "⚠️ "+text;',
@@ -546,7 +600,6 @@ function buildJS(): string {
         '  scrollToBottom();',
         '}',
         '',
-        // ── CHANGE 3: getActionLabel now uses agenticFile directly instead of content-sniffing ──
         'function getActionLabel(intent, content, agenticFile) {',
         '  var fname = agenticFile || "file";',
         '  if (intent === "VAANI") { return fname.indexOf(".") > 0 ? "\u270f\ufe0f Save to " + fname + "?" : "\u270f\ufe0f Write changes to file?"; }',
@@ -567,6 +620,14 @@ function buildJS(): string {
         'function rejectAction(actionId) {',
         '  vscode.postMessage({ command: "rejectAction", id: actionId });',
         '  delete pendingActions[actionId];',
+        '}',
+        '',
+        'function isGuardrailResponse(text) {',
+        '  if (!text) { return false; }',
+        '  return text.includes("कर्म-कवच") || text.includes("Karma-Kavach Alert") ||',
+        '    text.includes("karma-kavach") || text.includes("ಕರ್ಮ-ಕವಚ") ||',
+        '    text.includes("கர்ம-கவசம்") || text.includes("కర్మ-కవచం") ||',
+        '    /blocked.*request|request.*blocked/i.test(text);',
         '}',
         '',
         'function addResponse(msg) {',
@@ -592,7 +653,8 @@ function buildJS(): string {
         '    + "<span class=\\"msg-lang\\">"+(msg.detected_lang||"")+"</span>"',
         '    + "</div>";',
         '  var queryHtml = msg.query ? "<div class=\\"msg-query\\">\\""+msg.query+"\\"</div>" : "";',
-        '  el.innerHTML = metaHtml + queryHtml + "<div class=\\"msg-response\\">"+rendered+"</div>" + agenticHtml;',
+        '  var cls = isGuardrailResponse(msg.response) ? "msg-response guardrail-warn" : "msg-response";',
+        '  el.innerHTML = metaHtml + queryHtml + "<div class=\\"" + cls + "\\">"+rendered+"</div>" + agenticHtml;',
         '  el.querySelectorAll("pre").forEach(function(pre) {',
         '    pre.style.position = "relative";',
         '    var btn = document.createElement("button");',
