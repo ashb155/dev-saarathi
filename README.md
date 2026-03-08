@@ -14,7 +14,7 @@
 | **Context-Aware** | Automatically includes your active file, diagnostics, and workspace info |
 | **Agentic Actions** | One-click "Apply Code" inserts generated code directly into your editor |
 | **Smart Polling** | Exponential backoff (3s → 5s → 8s) for responsive results without overloading |
-| **Browser Mic Fallback** | Works in GitHub Codespaces / vscode.dev via Web Audio API when Python isn't available |
+| **Browser Mic Fallback** | Works in GitHub Codespaces — opens a mic recorder tab when Python/webview mic are unavailable |
 
 ## Architecture
 
@@ -45,8 +45,9 @@
 1. Click the **"Open in GitHub Codespaces"** badge above
 2. Wait for the container to build (~2 min) — it auto-installs dependencies, compiles, and packages the VSIX
 3. Press **F5** to launch the Extension Development Host
-4. Open the **Dev-Saarathi** panel from the Activity Bar (robot icon)
-5. Type in Hindi/Tamil/etc. or click the mic button
+4. Click the **Dev-Saarathi** robot icon (🤖) in the Activity Bar
+5. **Text:** Type a question in Hindi/Tamil/etc.
+6. **Voice:** Click 🎤 Speak Now → a new browser tab opens for mic recording → speak → audio is sent back automatically
 
 ### Option 2: Local Development
 
@@ -68,7 +69,7 @@ pip install sounddevice numpy
 
 1. Open the **Dev-Saarathi** panel from the Activity Bar
 2. **Text (GYAAN):** Type your question in any supported language and press Enter
-3. **Voice (VAANI):** Click 🎤, speak for up to 15 seconds, click ⏹ to stop
+3. **Voice (VAANI):** Click 🎤 Speak Now, select duration (5s/7s/10s/15s), speak — recording auto-stops and processes
 4. View the AI response with syntax-highlighted code blocks
 5. Click **"Apply Code"** to insert generated code into your active editor
 
@@ -97,7 +98,7 @@ The serverless backend lives in a separate repo: [ashb155/ds_arch](https://githu
 ```
 dev-saarathi/
 ├── src/
-│   └── extension.ts          # Main extension (~750 lines)
+│   └── extension.ts          # Main extension (~880 lines)
 ├── .devcontainer/
 │   └── devcontainer.json     # Codespaces config
 ├── package.json              # Extension manifest
