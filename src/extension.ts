@@ -97,7 +97,7 @@ function waitForBrowserAudio(webview: vscode.Webview, seconds: number): Promise<
     });
 }
 
-function getRecordingPageHTML(seconds: number, postbackUrl: string): string {
+function getRecordingPageHTML(seconds: number): string {
     return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Dev-Saarathi Mic</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:#1a1a2e;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}
 .card{background:#16213e;padding:40px;border-radius:16px;text-align:center;max-width:400px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
@@ -128,7 +128,7 @@ h2{margin-bottom:12px;color:#ff6b35}p{margin-bottom:20px;color:#aaa;font-size:14
     const pcm=new Float32Array(total);let off=0;for(const c of chunks){pcm.set(c,off);off+=c.length;}
     let sumSq=0;for(let j=0;j<pcm.length;j++)sumSq+=pcm[j]*pcm[j];
     if(Math.sqrt(sumSq/pcm.length)<0.003){
-      await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:'SILENCE'})});
+      await fetch('/audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:'SILENCE'})});
       st.innerHTML='<span class="err">No audio detected. Close this tab and try again.</span>';return;
     }
     const gained=new Float32Array(pcm.length);for(let k=0;k<pcm.length;k++)gained[k]=Math.max(-1,Math.min(1,pcm[k]*4));
@@ -146,12 +146,12 @@ h2{margin-bottom:12px;color:#ff6b35}p{margin-bottom:20px;color:#aaa;font-size:14
     for(let i=0;i<bytes.length;i+=ch)b64+=String.fromCharCode.apply(null,Array.from(bytes.subarray(i,i+ch)));
     b64=btoa(b64);
     st.textContent='Sending to Dev-Saarathi...';
-    await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:b64})});
+    await fetch('/audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:b64})});
     st.innerHTML='<span class="done">&#10003; Done! You can close this tab.</span>';pu.style.display='none';
   }catch(err){
     pu.style.display='none';
     st.innerHTML='<span class="err">'+err.message+'</span>';
-    await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:err.message||'Mic denied'})});
+    await fetch('/audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:err.message||'Mic denied'})});
   }
 })();
 </script></body></html>`;
@@ -169,7 +169,7 @@ function recordViaExternalPage(seconds: number): Promise<string> {
             if (req.method === 'GET') {
                 const addr = server.address() as { port: number };
                 res.writeHead(200, { 'Content-Type': 'text/html' });
-                res.end(getRecordingPageHTML(seconds, `http://localhost:${addr.port}/audio`));
+                res.end(getRecordingPageHTML(seconds));
                 return;
             }
             if (req.method === 'POST') {
