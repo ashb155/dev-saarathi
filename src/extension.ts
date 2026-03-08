@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as https from 'https';
+import * as http from 'http';
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -93,6 +94,121 @@ function waitForBrowserAudio(webview: vscode.Webview, seconds: number): Promise<
         browserAudioResolve = resolve;
         browserAudioReject = reject;
         webview.postMessage({ command: 'recordAudioBrowser', seconds: seconds });
+    });
+}
+
+function getRecordingPageHTML(seconds: number, postbackUrl: string): string {
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Dev-Saarathi Mic</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:#1a1a2e;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}
+.card{background:#16213e;padding:40px;border-radius:16px;text-align:center;max-width:400px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h2{margin-bottom:12px;color:#ff6b35}p{margin-bottom:20px;color:#aaa;font-size:14px}
+.status{font-size:18px;margin:20px 0;min-height:28px}
+.pulse{width:80px;height:80px;border-radius:50%;background:#ff6b35;margin:20px auto;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.15);opacity:.7}}
+.done{color:#4ecdc4;font-size:20px;font-weight:bold}.err{color:#ff4444}</style></head>
+<body><div class="card"><h2>&#127908; Dev-Saarathi Voice</h2>
+<p>Recording for ${seconds} seconds</p>
+<div class="pulse" id="pulse"></div>
+<div class="status" id="status">Requesting mic access...</div></div>
+<script>
+(async function(){
+  const st=document.getElementById('status'),pu=document.getElementById('pulse');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
+    st.textContent='Recording... Speak now!';
+    const ctx=new AudioContext();const src=ctx.createMediaStreamSource(stream);
+    const proc=ctx.createScriptProcessor(4096,1,1);const chunks=[];
+    proc.onaudioprocess=function(e){chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));};
+    src.connect(proc);proc.connect(ctx.destination);
+    let rem=${seconds};const iv=setInterval(()=>{rem--;st.textContent='Recording... '+rem+'s remaining';if(rem<=0)clearInterval(iv);},1000);
+    await new Promise(r=>setTimeout(r,${seconds}*1000));
+    clearInterval(iv);proc.disconnect();src.disconnect();stream.getTracks().forEach(t=>t.stop());await ctx.close();
+    st.textContent='Processing audio...';pu.style.display='none';
+    let total=0;for(const c of chunks)total+=c.length;
+    const pcm=new Float32Array(total);let off=0;for(const c of chunks){pcm.set(c,off);off+=c.length;}
+    let sumSq=0;for(let j=0;j<pcm.length;j++)sumSq+=pcm[j]*pcm[j];
+    if(Math.sqrt(sumSq/pcm.length)<0.003){
+      await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:'SILENCE'})});
+      st.innerHTML='<span class="err">No audio detected. Close this tab and try again.</span>';return;
+    }
+    const gained=new Float32Array(pcm.length);for(let k=0;k<pcm.length;k++)gained[k]=Math.max(-1,Math.min(1,pcm[k]*4));
+    const ratio=ctx.sampleRate?Math.round(ctx.sampleRate/16000):3;
+    const dsLen=Math.ceil(gained.length/ratio);const ds=new Float32Array(dsLen);
+    for(let i=0;i<dsLen;i++){let sum=0,cnt=0;for(let j=0;j<ratio&&i*ratio+j<gained.length;j++){sum+=gained[i*ratio+j];cnt++;}ds[i]=sum/cnt;}
+    const bufLen=44+ds.length*2;const buf=new ArrayBuffer(bufLen);const v=new DataView(buf);
+    function ws(o,s){for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}
+    ws(0,'RIFF');v.setUint32(4,bufLen-8,true);ws(8,'WAVE');ws(12,'fmt ');
+    v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+    v.setUint32(24,16000,true);v.setUint32(28,32000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+    ws(36,'data');v.setUint32(40,ds.length*2,true);
+    for(let i=0;i<ds.length;i++){const s=Math.max(-1,Math.min(1,ds[i]));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true);}
+    const bytes=new Uint8Array(buf);let b64='';const ch=8192;
+    for(let i=0;i<bytes.length;i+=ch)b64+=String.fromCharCode.apply(null,Array.from(bytes.subarray(i,i+ch)));
+    b64=btoa(b64);
+    st.textContent='Sending to Dev-Saarathi...';
+    await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:b64})});
+    st.innerHTML='<span class="done">&#10003; Done! You can close this tab.</span>';pu.style.display='none';
+  }catch(err){
+    pu.style.display='none';
+    st.innerHTML='<span class="err">'+err.message+'</span>';
+    await fetch('${postbackUrl}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error:err.message||'Mic denied'})});
+  }
+})();
+</script></body></html>`;
+}
+
+function recordViaExternalPage(seconds: number): Promise<string> {
+    return new Promise(async (resolve, reject) => {
+        let settled = false;
+        const server = http.createServer((req, res) => {
+            if (req.method === 'OPTIONS') {
+                res.writeHead(200, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+                res.end();
+                return;
+            }
+            if (req.method === 'GET') {
+                const addr = server.address() as { port: number };
+                res.writeHead(200, { 'Content-Type': 'text/html' });
+                res.end(getRecordingPageHTML(seconds, `http://localhost:${addr.port}/audio`));
+                return;
+            }
+            if (req.method === 'POST') {
+                let body = '';
+                req.on('data', (chunk: string) => { body += chunk; });
+                req.on('end', () => {
+                    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+                    res.end('{"ok":true}');
+                    if (!settled) {
+                        settled = true;
+                        try {
+                            const data = JSON.parse(body);
+                            if (data.error) { reject(new Error(data.error)); }
+                            else if (data.audio) { resolve(data.audio); }
+                            else { reject(new Error('No audio data received')); }
+                        } catch (e) { reject(e as Error); }
+                    }
+                    setTimeout(() => { try { server.close(); } catch (_e) { /* ignore */ } }, 500);
+                });
+                return;
+            }
+            res.writeHead(404); res.end();
+        });
+        server.listen(0, async () => {
+            const addr = server.address() as { port: number };
+            const localUri = vscode.Uri.parse(`http://localhost:${addr.port}`);
+            try {
+                const externalUri = await vscode.env.asExternalUri(localUri);
+                await vscode.env.openExternal(externalUri);
+            } catch (e) {
+                if (!settled) { settled = true; reject(e as Error); }
+                try { server.close(); } catch (_e) { /* ignore */ }
+            }
+        });
+        // Timeout safety net
+        setTimeout(() => {
+            if (!settled) { settled = true; reject(new Error('Recording timed out')); }
+            try { server.close(); } catch (_e) { /* ignore */ }
+        }, (seconds + 60) * 1000);
     });
 }
 
@@ -320,8 +436,15 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         } catch (recErr) {
             if (String(recErr).includes('SILENCE')) { throw recErr; }
             // Python recording failed (Codespaces, no audio device, etc.)
-            webview.postMessage({ command: 'status', text: '🎤 Recording via browser mic for ' + seconds + 's...' });
-            audioBase64 = await waitForBrowserAudio(webview, seconds);
+            try {
+                webview.postMessage({ command: 'status', text: '🎤 Recording via browser mic for ' + seconds + 's...' });
+                audioBase64 = await waitForBrowserAudio(webview, seconds);
+            } catch (browserErr) {
+                if (String(browserErr).includes('SILENCE')) { throw browserErr; }
+                // Webview mic also blocked (iframe sandbox) — open external tab
+                webview.postMessage({ command: 'status', text: '🎤 Opening mic recorder in new tab...' });
+                audioBase64 = await recordViaExternalPage(seconds);
+            }
         }
         if (pollingAborted) { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); return; }
         const codeContext = getActiveFileContent();
