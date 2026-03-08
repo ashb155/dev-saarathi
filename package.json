@@ -17,7 +17,7 @@
         {
           "id": "dev-saarathi-sidebar",
           "title": "Dev-Saarathi",
-          "icon": "$(hubot)" 
+          "icon": "$(hubot)"
         }
       ]
     },
@@ -26,7 +26,8 @@
         {
           "type": "webview",
           "id": "devSaarathi.chatView",
-          "name": "Indic Developer Assistant"
+          "name": "Indic Developer Assistant",
+          "icon": "$(hubot)"
         }
       ]
     },

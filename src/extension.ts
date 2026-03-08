@@ -54,6 +54,11 @@ async function recordAudioWithPython(seconds: number): Promise<string> {
         'recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype="int16")',
         'sd.wait()',
         'recording = np.clip(recording * 4, -32768, 32767).astype("int16")',
+        '# Silence detection — reject if RMS volume is too low',
+        'rms = np.sqrt(np.mean(recording.astype(np.float32) ** 2))',
+        'if rms < 80:',
+        '    print("SILENCE", flush=True)',
+        '    exit(0)',
         'wf = wave.open(r"' + escapedTmp + '", "wb")',
         'wf.setnchannels(1)',
         'wf.setsampwidth(2)',
@@ -72,8 +77,9 @@ async function recordAudioWithPython(seconds: number): Promise<string> {
         proc.stdout.on('data', (d: Buffer) => { output += d.toString(); });
         proc.stderr.on('data', (d: Buffer) => { error += d.toString(); });
         proc.on('close', (code: number) => {
-            try { fs.unlinkSync(tmpFile); } catch {}
-            if (code === 0 && output.trim()) { resolve(output.trim()); }
+            try { fs.unlinkSync(tmpFile); } catch { }
+            if (code === 0 && output.trim() === 'SILENCE') { reject(new Error('SILENCE')); }
+            else if (code === 0 && output.trim()) { resolve(output.trim()); }
             else { reject(new Error(error || 'Recording failed')); }
         });
     });
@@ -114,17 +120,20 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
-    constructor(private readonly extensionUri: vscode.Uri) {}
+    constructor(private readonly extensionUri: vscode.Uri) { }
 
     resolveWebviewView(webviewView: vscode.WebviewView) {
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = getWebviewContent();
 
-        const updateContext = () => {
+        const updateContext = async () => {
             const editor = vscode.window.activeTextEditor;
-            if (editor) {
-                webviewView.webview.postMessage({ command: 'context', filename: path.basename(editor.document.fileName) });
-            }
+            const files = await vscode.workspace.findFiles('**/*', '**/node_modules/**', 5);
+            const isProject = files.length > 1;
+            const label = isProject
+                ? (editor ? path.basename(editor.document.fileName) + ' + project' : 'Project')
+                : (editor ? path.basename(editor.document.fileName) : 'No file open');
+            webviewView.webview.postMessage({ command: 'context', filename: label });
         };
         updateContext();
         vscode.window.onDidChangeActiveTextEditor(updateContext);
@@ -135,7 +144,7 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
             } else if (message.command === 'getHistory') {
                 await loadHistory(webviewView.webview);
             } else if (message.command === 'acceptAction') {
-                await executeAgenticAction(message.intent, message.content);
+                await executeAgenticAction(message.intent, message.content, message.agentic_file);
                 webviewView.webview.postMessage({ command: 'actionDone', id: message.id });
             } else if (message.command === 'rejectAction') {
                 webviewView.webview.postMessage({ command: 'actionDone', id: message.id });
@@ -144,56 +153,74 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
     }
 }
 
-async function executeAgenticAction(intent: string, content: string) {
-    if (intent.includes('GIT')) {
-        const commitMsg = content.replace(/^"|"$/g, '').trim();
-        const terminal = vscode.window.createTerminal('Dev-Saarathi Git');
-        terminal.show();
-        terminal.sendText('git add . && git commit -m "' + commitMsg + '"');
-        vscode.window.showInformationMessage('✅ Dev-Saarathi: Git commit executed!');
-        return;
-    }
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
-    const root = workspaceFolders[0].uri;
-    const contentLower = content.toLowerCase();
-    const isReadme = intent.includes('README') || contentLower.includes('readme') || contentLower.includes('## installation') || contentLower.includes('## usage');
-    const isTest = intent.includes('TEST') || contentLower.includes('def test_') || contentLower.includes('import unittest') || contentLower.includes('import pytest');
-    const isGit = intent.includes('GIT') || contentLower.includes('git commit');
-
-    // For README: write the full response as-is (it IS the markdown)
-    // For TESTS: extract just the code block
-    // For others: write full response
-    let cleanContent: string;
-    if (isTest) {
+async function executeAgenticAction(intent: string, content: string, agenticFile?: string) {
+    // ── VAANI — write new/updated code to file ─────────────────────────────────
+    if (intent === 'VAANI' && agenticFile) {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
+        const root = workspaceFolders[0].uri;
         const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
-        cleanContent = codeMatch ? codeMatch[1].trim() : content.trim();
-    } else {
-        // README or general: strip surrounding explanation, keep full markdown
-        // Remove any leading non-markdown preamble (lines before first # heading)
-        const firstHeading = content.indexOf('\n#');
-        cleanContent = firstHeading > 0 ? content.slice(firstHeading + 1).trim() : content.trim();
-    }
-
-    let fileName = 'dev-saarathi-output.md';
-    if (isReadme) { fileName = 'README.md'; }
-    else if (isTest) {
-        const editor = vscode.window.activeTextEditor;
-        const baseName = editor ? path.basename(editor.document.fileName, path.extname(editor.document.fileName)) : 'code';
-        fileName = 'test_' + baseName + '.py';
-    } else if (isGit) {
-        const commitMsg = cleanContent.replace(/^"|"$/g, '').trim();
-        const terminal = vscode.window.createTerminal('Dev-Saarathi Git');
-        terminal.show();
-        terminal.sendText('git add . && git commit -m "' + commitMsg + '"');
-        vscode.window.showInformationMessage('✅ Dev-Saarathi: Git commit executed!');
+        const cleanCode = codeMatch ? codeMatch[1].trim() : content.trim();
+        const fileUri = vscode.Uri.joinPath(root, agenticFile);
+        let fileExists = false;
+        try { await vscode.workspace.fs.stat(fileUri); fileExists = true; } catch { }
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(cleanCode));
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        await vscode.window.showTextDocument(doc, { preview: false });
+        const msg = fileExists ? '✅ Dev-Saarathi updated ' + agenticFile : '✨ Dev-Saarathi created ' + agenticFile;
+        vscode.window.showInformationMessage(msg);
         return;
     }
-    const fileUri = vscode.Uri.joinPath(root, fileName);
-    await vscode.workspace.fs.writeFile(fileUri, Buffer.from(cleanContent));
-    const doc = await vscode.workspace.openTextDocument(fileUri);
-    await vscode.window.showTextDocument(doc, { preview: false });
-    vscode.window.showInformationMessage('✅ Dev-Saarathi created ' + fileName);
+
+    // ── DOSH — write fixed code back to same file ──────────────────────────────
+    if (intent === 'DOSH' && agenticFile) {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
+        const root = workspaceFolders[0].uri;
+        const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
+        const cleanCode = codeMatch ? codeMatch[1].trim() : content.trim();
+        const fileUri = vscode.Uri.joinPath(root, agenticFile);
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(cleanCode));
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        await vscode.window.showTextDocument(doc, { preview: false });
+        vscode.window.showInformationMessage('🔧 Dev-Saarathi applied fix to ' + agenticFile);
+        return;
+    }
+
+    // ── KARMA GIT — open terminal, paste commands, let developer review & run ──
+    if (agenticFile === '__GIT__') {
+        const terminal = vscode.window.createTerminal('Dev-Saarathi Git');
+        terminal.show();
+        terminal.sendText('# Suggested by Dev-Saarathi — review and press Enter to run:');
+        const bashMatch = content.match(/```bash\n([\s\S]*?)```/);
+        if (bashMatch) {
+            bashMatch[1].trim().split('\n').forEach(line => terminal.sendText(line, false));
+        }
+        vscode.window.showInformationMessage('🚀 Dev-Saarathi: Git commands ready in terminal — review and run!');
+        return;
+    }
+
+    // ── KARMA README / TESTS — write to file using agenticFile from processor ──
+    if (agenticFile) {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) { vscode.window.showErrorMessage('No workspace folder open!'); return; }
+        const root = workspaceFolders[0].uri;
+        const isTest = agenticFile.startsWith('test_') || agenticFile === 'test_suite.py';
+        let cleanContent: string;
+        if (isTest) {
+            const codeMatch = content.match(/```(?:\w+)?\n([\s\S]*?)```/);
+            cleanContent = codeMatch ? codeMatch[1].trim() : content.trim();
+        } else {
+            // README — strip preamble before first heading
+            const firstHeading = content.indexOf('\n#');
+            cleanContent = firstHeading > 0 ? content.slice(firstHeading + 1).trim() : content.trim();
+        }
+        const fileUri = vscode.Uri.joinPath(root, agenticFile);
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(cleanContent));
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        await vscode.window.showTextDocument(doc, { preview: false });
+        vscode.window.showInformationMessage('✅ Dev-Saarathi created ' + agenticFile);
+    }
 }
 
 async function handleRecording(webview: vscode.Webview, seconds: number) {
@@ -201,11 +228,14 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
     try {
         webview.postMessage({ command: 'status', text: 'Recording for ' + seconds + 's... Speak now!' });
         const audioBase64 = await recordAudioWithPython(seconds);
-        let codeContext = getActiveFileContent();
-        if (!codeContext) { codeContext = await getWorkspaceContent(); }
+        const codeContext = getActiveFileContent();
+        const workspaceContext = await getWorkspaceContent();
         webview.postMessage({ command: 'status', text: 'Transcribing your voice...' });
         const body: Record<string, string> = { audio: audioBase64, user_id: userId };
-        if (codeContext) { body.code_context = codeContext; }
+        const activeEditor = vscode.window.activeTextEditor;
+        if (workspaceContext) { body.code_context = workspaceContext; }
+        else if (codeContext) { body.code_context = codeContext; }
+        if (activeEditor) { body.active_filename = path.basename(activeEditor.document.fileName); }
         const triggerRaw = await httpsPost(API_BASE + '/voice', JSON.stringify(body));
         const triggerData = JSON.parse(triggerRaw) as { job_id?: string; error?: string };
         if (!triggerData.job_id) { webview.postMessage({ command: 'error', text: triggerData.error || 'Failed to start job' }); return; }
@@ -213,16 +243,45 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         for (let i = 0; i < 60; i++) {
             await sleep(3000);
             const resultRaw = await httpsGet(API_BASE + '/result/' + triggerData.job_id);
-            const resultData = JSON.parse(resultRaw) as { status: string; query?: string; response?: string; intent?: string; detected_lang?: string; error?: string; };
+            const resultData = JSON.parse(resultRaw) as {
+                status: string;
+                query?: string;
+                response?: string;
+                intent?: string;
+                detected_lang?: string;
+                error?: string;
+                agentic_file?: string;
+                proposed_code?: string;
+            };
             if (resultData.status === 'COMPLETED') {
-                webview.postMessage({ command: 'response', query: resultData.query, response: resultData.response, intent: resultData.intent, detected_lang: resultData.detected_lang, agentic: resultData.intent ? resultData.intent.startsWith('KARMA') : false });
+                const intent = resultData.intent || '';
+                // ── CHANGE 1: DOSH and KARMA now included, all gated on agentic_file ──
+                const isAgentic = !!(intent === 'VAANI' && resultData.agentic_file)
+                    || !!(intent === 'DOSH' && resultData.agentic_file)
+                    || !!(intent === 'KARMA' && resultData.agentic_file);
+                webview.postMessage({
+                    command: 'response',
+                    query: resultData.query,
+                    response: resultData.response,
+                    intent: intent,
+                    detected_lang: resultData.detected_lang,
+                    agentic: isAgentic,
+                    agentic_file: resultData.agentic_file || null
+                });
                 return;
             } else if (resultData.status === 'FAILED') {
                 webview.postMessage({ command: 'error', text: resultData.error || 'Processing failed' }); return;
             }
         }
         webview.postMessage({ command: 'error', text: 'Request timed out' });
-    } catch (err) { webview.postMessage({ command: 'error', text: String(err) }); }
+    } catch (err) {
+        const msg = String(err);
+        if (msg.includes('SILENCE')) {
+            webview.postMessage({ command: 'error', text: '🤫 No audio detected — please speak clearly and try again!' });
+        } else {
+            webview.postMessage({ command: 'error', text: msg });
+        }
+    }
 }
 
 async function loadHistory(webview: vscode.Webview) {
@@ -233,7 +292,6 @@ async function loadHistory(webview: vscode.Webview) {
 }
 
 function getWebviewContent(): string {
-    // Build the JS separately to avoid template literal issues
     const js = buildJS();
     const css = buildCSS();
     const html = [
@@ -244,6 +302,9 @@ function getWebviewContent(): string {
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
         '<title>Dev-Saarathi</title>',
         "<style>@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap');</style>",
+        '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>',
+        '<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>',
+        '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">',
         '<style>' + css + '</style>',
         '</head>',
         '<body>',
@@ -307,19 +368,23 @@ function buildCSS(): string {
         '.badge-KARMA { background: rgba(255,234,167,0.15); color: #c9a227; border: 1px solid rgba(255,234,167,0.3); }',
         '.msg-lang { font-size: 9px; color: var(--muted); margin-left: auto; }',
         '.msg-query { font-size: 11px; color: var(--muted); font-style: italic; padding-left: 2px; }',
-        '.msg-response { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12px; line-height: 1.7; white-space: pre-wrap; font-family: \"JetBrains Mono\", monospace; word-break: break-word; }',
-        '.msg-response p { margin-bottom: 10px; line-height: 1.8; }',
+        '.msg-response { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; font-size: 12px; line-height: 1.8; color: var(--text); word-break: break-word; font-family: "JetBrains Mono", monospace; }',
+        '.msg-response p { margin-bottom: 8px; }',
+        '.msg-response p:last-child { margin-bottom: 0; }',
         '.msg-response strong { color: var(--accent2); font-weight: 600; }',
         '.msg-response em { color: var(--muted); }',
         '.msg-response h1, .msg-response h2, .msg-response h3 { color: var(--accent2); margin: 10px 0 6px; font-size: 13px; font-weight: 700; }',
-        '.msg-response ul { padding-left: 16px; margin: 6px 0; list-style: disc; }',
+        '.msg-response ul, .msg-response ol { padding-left: 16px; margin: 6px 0; }',
         '.msg-response li { margin: 3px 0; font-size: 12px; }',
-        '.code-block { background: #000; border: 1px solid var(--border); border-radius: 6px; margin: 12px 0; overflow-x: auto; position: relative; }',
-        '.code-block code { font-family: "JetBrains Mono", monospace; font-size: 11px; line-height: 1.6; padding: 32px 12px 12px; display: block; color: #abb2bf; white-space: pre; background: #000; }',
-        '.code-lang { position: absolute; top: 6px; left: 10px; font-size: 8px; color: var(--muted); font-family: "JetBrains Mono", monospace; text-transform: uppercase; letter-spacing: 1px; }',
-        '.copy-btn { position: absolute; top: 4px; right: 6px; background: var(--border); border: none; color: var(--muted); font-size: 9px; padding: 3px 7px; border-radius: 4px; cursor: pointer; transition: all 0.15s; letter-spacing: 0.5px; }',
+        '.msg-response blockquote { border-left: 2px solid var(--accent); padding-left: 10px; color: var(--muted); margin: 6px 0; }',
+        '.msg-response hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }',
+        '.msg-response pre { background: #0a0a0c !important; border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; overflow-x: auto; position: relative; }',
+        '.msg-response pre code { font-family: "JetBrains Mono", monospace !important; font-size: 11px !important; line-height: 1.6; padding: 32px 12px 12px !important; display: block; background: transparent !important; }',
+        '.msg-response code:not(pre code) { font-family: "JetBrains Mono", monospace; font-size: 11px; background: rgba(255,107,53,0.1); color: var(--accent); padding: 1px 5px; border-radius: 3px; }',
+        '.copy-btn { position: absolute; top: 6px; right: 6px; background: var(--border); border: none; color: var(--muted); font-size: 9px; padding: 3px 7px; border-radius: 4px; cursor: pointer; transition: all 0.15s; letter-spacing: 0.5px; }',
         '.copy-btn:hover { background: var(--accent); color: white; }',
         '.inline-code { font-family: "JetBrains Mono", monospace; font-size: 11px; background: rgba(255,107,53,0.1); color: var(--accent); padding: 1px 5px; border-radius: 3px; }',
+        '.code-lang { position: absolute; top: 6px; left: 10px; font-size: 9px; color: var(--muted); font-family: "JetBrains Mono", monospace; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }',
         '.status { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); padding: 8px 12px; background: var(--surface); border-radius: 8px; border: 1px solid var(--border); animation: slideIn 0.3s ease; }',
         '.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }',
         '@keyframes spin { to { transform: rotate(360deg); } }',
@@ -354,52 +419,24 @@ function buildJS(): string {
         'var actionCounter = 0;',
         'var pendingActions = {};',
         '',
+        'var markedRenderer = new marked.Renderer();',
+        'markedRenderer.code = function(code, lang) {',
+        '  var language = (lang && hljs.getLanguage(lang)) ? lang : "plaintext";',
+        '  var highlighted = hljs.highlight(code, { language: language }).value;',
+        '  var langLabel = lang ? "<span class=\\"code-lang\\">"+lang+"</span>" : "";',
+        '  return "<pre>"+langLabel+"<code class=\\"hljs language-"+language+"\\">"+highlighted+"</code></pre>";',
+        '};',
+        'marked.use({ renderer: markedRenderer, breaks: true, gfm: true });',
+        '',
         'function renderMarkdown(text) {',
-        '  var blocks = [];',
         '  var TICK = String.fromCharCode(96);',
         '  var FENCE = TICK+TICK+TICK;',
-        '  var fenceRe = new RegExp(FENCE+"(\\\\w*)\\\\n([\\\\s\\\\S]*?)"+FENCE, "g");',
         '  text = text.replace(/([a-zA-Z]+)COPY`([^`]+)`/g, function(_, lang, code) { return FENCE + lang + "\\n" + code.trim() + "\\n" + FENCE; });',
-        '  text = text.replace(fenceRe, function(_, lang, code) {',
-        '    blocks.push({ lang: lang||"", code: code.trim() });',
-        '    return "%%%BLOCK_"+(blocks.length-1)+"%%%";',
-        '  });',
-        '  var inlineRe = new RegExp(TICK+"([^"+TICK+"]+)"+TICK, "g");',
-        '  text = text.replace(inlineRe, function(_, c) { return "<span class=\\"inline-code\\">"+c+"</span>"; });',
-        '  text = text.replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>");',
-        '  text = text.replace(/\\*([^*]+)\\*/g, "<em>$1</em>");',
-        '  text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>");',
-        '  text = text.replace(/^## (.+)$/gm, "<h2>$1</h2>");',
-        '  text = text.replace(/^# (.+)$/gm, "<h1>$1</h1>");',
-        '  text = text.replace(/^[-*] (.+)$/gm, "<li>$1</li>");',
-        '  text = text.replace(/^\\d+\\. (.+)$/gm, "<li>$1</li>");',
-        '  var lines = text.split("\\n");',
-        '  var out = []; var inList = false;',
-        '  for (var i=0; i<lines.length; i++) {',
-        '    var t = lines[i].trim();',
-        '    if (t.indexOf("<li>") === 0) {',
-        '      if (!inList) { out.push("<ul>"); inList=true; }',
-        '      out.push(t);',
-        '    } else {',
-        '      if (inList) { out.push("</ul>"); inList=false; }',
-        '      if (t && t.indexOf("<h")<0 && t.indexOf("%%%")<0) { out.push("<p>"+t+"</p>"); }',
-        '      else { out.push(t); }',
-        '    }',
-        '  }',
-        '  if (inList) { out.push("</ul>"); }',
-        '  text = out.join("");',
-        '  for (var j=0; j<blocks.length; j++) {',
-        '    var b = blocks[j];',
-        '    var esc = b.code.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");',
-        '    var langSpan = b.lang ? "<span class=\\"code-lang\\">"+b.lang+"</span>" : "";',
-        '    var html = "<div class=\\"code-block\\">"+langSpan+"<button class=\\"copy-btn\\" onclick=\\"copyCode(this)\\">COPY</button><code>"+esc+"</code></div>";',
-        '    text = text.replace("%%%BLOCK_"+j+"%%%", html);',
-        '  }',
-        '  return text;',
+        '  return marked.parse(text);',
         '}',
         '',
         'function copyCode(btn) {',
-        '  var code = btn.nextElementSibling.innerText;',
+        '  var code = btn.previousElementSibling ? btn.previousElementSibling.innerText : btn.closest("pre").querySelector("code").innerText;',
         '  navigator.clipboard.writeText(code);',
         '  btn.textContent = "COPIED!";',
         '  setTimeout(function(){ btn.textContent = "COPY"; }, 2000);',
@@ -466,18 +503,20 @@ function buildJS(): string {
         '  scrollToBottom();',
         '}',
         '',
-        'function getActionLabel(intent, content) {',
-        '  var c = (content||"").toLowerCase();',
-        '  if (c.indexOf("## installation")>=0 || c.indexOf("## usage")>=0 || c.indexOf("readme")>=0) { return "\U0001f4c4 Create README.md in workspace?"; }',
-        '  if (c.indexOf("def test_")>=0 || c.indexOf("import pytest")>=0 || c.indexOf("import unittest")>=0) { return "\U0001f9ea Create test file in workspace?"; }',
-        '  if (c.indexOf("git commit")>=0 || c.indexOf("git add")>=0) { return "\U0001f680 Run git add . && git commit?"; }',
-        '  return "\U0001f4be Save output to file?";',
+        // ── CHANGE 3: getActionLabel now uses agenticFile directly instead of content-sniffing ──
+        'function getActionLabel(intent, content, agenticFile) {',
+        '  if (intent === "VAANI") { var fname = agenticFile || "file"; return fname.indexOf(".") > 0 ? "\\u270f\\ufe0f Save to " + fname + "?" : "\\u270f\\ufe0f Write changes to file?"; }',
+        '  if (intent === "DOSH") { var fname = agenticFile || "file"; return "\\uD83D\\uDD27 Apply fix to " + fname + "?"; }',
+        '  if (agenticFile === "__GIT__") { return "\\uD83D\\uDE80 Open git commands in terminal?"; }',
+        '  if (agenticFile === "README.md") { return "\\uD83D\\uDCC4 Create README.md in workspace?"; }',
+        '  if (agenticFile && agenticFile.indexOf("test") === 0) { return "\\uD83E\\uDDEA Create " + agenticFile + " in workspace?"; }',
+        '  return "\\uD83D\\uDCBE Save output to file?";',
         '}',
         '',
         'function acceptAction(actionId) {',
         '  var data = pendingActions[actionId];',
         '  if (!data) { return; }',
-        '  vscode.postMessage({ command: "acceptAction", id: actionId, intent: data.intent, content: data.content });',
+        '  vscode.postMessage({ command: "acceptAction", id: actionId, intent: data.intent, content: data.content, agentic_file: data.agentic_file || null });',
         '  delete pendingActions[actionId];',
         '}',
         '',
@@ -494,11 +533,11 @@ function buildJS(): string {
         '  el.className = "msg";',
         '  var actionId = "act-"+(actionCounter++);',
         '  if (msg.agentic) {',
-        '    pendingActions[actionId] = { intent: intent, content: msg.response || "" };',
+        '    pendingActions[actionId] = { intent: intent, content: msg.response || "", agentic_file: msg.agentic_file || null };',
         '  }',
         '  var agenticHtml = "";',
         '  if (msg.agentic) {',
-        '    agenticHtml = "<div class=\\"action-label\\">"+getActionLabel(intent, msg.response)+"</div>"',
+        '    agenticHtml = "<div class=\\"action-label\\">"+getActionLabel(intent, msg.response, msg.agentic_file)+"</div>"',
         '      + "<div class=\\"action-bar\\" id=\\"action-"+actionId+"\\">"',
         '      + "<button class=\\"btn-accept\\" onclick=\\"acceptAction(\'"+actionId+"\')\\" >✓ Accept</button>"',
         '      + "<button class=\\"btn-reject\\" onclick=\\"rejectAction(\'"+actionId+"\')\\" >✕ Reject</button>"',
@@ -510,6 +549,19 @@ function buildJS(): string {
         '    + "</div>";',
         '  var queryHtml = msg.query ? "<div class=\\"msg-query\\">\\""+msg.query+"\\"</div>" : "";',
         '  el.innerHTML = metaHtml + queryHtml + "<div class=\\"msg-response\\">"+rendered+"</div>" + agenticHtml;',
+        '  el.querySelectorAll("pre").forEach(function(pre) {',
+        '    pre.style.position = "relative";',
+        '    var btn = document.createElement("button");',
+        '    btn.className = "copy-btn";',
+        '    btn.textContent = "COPY";',
+        '    btn.onclick = function() {',
+        '      var code = pre.querySelector("code");',
+        '      navigator.clipboard.writeText(code ? code.innerText : "");',
+        '      btn.textContent = "COPIED!";',
+        '      setTimeout(function(){ btn.textContent = "COPY"; }, 2000);',
+        '    };',
+        '    pre.appendChild(btn);',
+        '  });',
         '  document.getElementById("chat").appendChild(el);',
         '  scrollToBottom();',
         '}',
@@ -549,4 +601,4 @@ function buildJS(): string {
     ].join('\n');
 }
 
-export function deactivate() {}
+export function deactivate() { }
