@@ -1,11 +1,12 @@
 import * as vscode from 'vscode';
 import * as https from 'https';
-import * as child_process from 'child_process';
+import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
 const API_BASE = 'https://q2eaht6bo7.execute-api.ap-south-1.amazonaws.com/prod';
+let pollingAborted = false;
 
 function getUserId(): string {
     return `vscode-${vscode.env.machineId.substring(0, 16)}`;
@@ -20,7 +21,7 @@ function getActiveFileContent(): string | null {
 async function getWorkspaceContent(): Promise<string> {
     const skipFolders = new Set(['node_modules', '.git', '__pycache__', '.venv', 'venv', 'env', 'dist', 'build', '.idea', '.vscode', 'knowledge_base']);
     const supportedExts = new Set(['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rb', '.php', '.cs', '.cpp', '.c', '.h', '.rs', '.html', '.css', '.json', '.yaml', '.yml', '.toml', '.sh', '.sql']);
-    const files = await vscode.workspace.findFiles('**/*', '**/node_modules/**', 50);
+    const files = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**,**/__pycache__/**,**/.venv/**,**/venv/**,**/dist/**,**/build/**}', 50);
     let context = '';
     let totalChars = 0;
     for (const file of files) {
@@ -33,7 +34,7 @@ async function getWorkspaceContent(): Promise<string> {
             if (!content.trim()) { continue; }
             if (content.length > 5000) { content = content.substring(0, 5000) + '\n... [truncated]'; }
             const entry = '### FILE: ' + vscode.workspace.asRelativePath(file) + '\n```' + ext.slice(1) + '\n' + content + '\n```\n';
-            if (totalChars + entry.length > 100000) { break; }
+            if (totalChars + entry.length > 50000) { break; }
             context += entry;
             totalChars += entry.length;
         } catch { continue; }
@@ -71,7 +72,7 @@ async function recordAudioWithPython(seconds: number): Promise<string> {
     ].join('\n');
 
     return new Promise((resolve, reject) => {
-        const proc = child_process.spawn('python', ['-c', script]);
+        const proc = childProcess.spawn('python', ['-c', script]);
         let output = '';
         let error = '';
         proc.stdout.on('data', (d: Buffer) => { output += d.toString(); });
@@ -94,7 +95,13 @@ function httpsPost(url: string, body: string): Promise<string> {
         }, (res) => {
             let data = '';
             res.on('data', chunk => { data += chunk; });
-            res.on('end', () => { resolve(data); });
+            res.on('end', () => {
+                if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                } else {
+                    resolve(data);
+                }
+            });
         });
         req.on('error', reject);
         req.write(body);
@@ -107,7 +114,13 @@ function httpsGet(url: string): Promise<string> {
         https.get(url, (res) => {
             let data = '';
             res.on('data', chunk => { data += chunk; });
-            res.on('end', () => { resolve(data); });
+            res.on('end', () => {
+                if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                } else {
+                    resolve(data);
+                }
+            });
         }).on('error', reject);
     });
 }
@@ -117,6 +130,9 @@ function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, m
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DevSaarathiViewProvider(context.extensionUri);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('devSaarathi.chatView', provider));
+    context.subscriptions.push(vscode.commands.registerCommand('dev-saarathi.start', () => {
+        vscode.commands.executeCommand('devSaarathi.chatView.focus');
+    }));
 }
 
 class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
@@ -136,7 +152,8 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
             webviewView.webview.postMessage({ command: 'context', filename: label });
         };
         updateContext();
-        vscode.window.onDidChangeActiveTextEditor(updateContext);
+        const editorListener = vscode.window.onDidChangeActiveTextEditor(updateContext);
+        webviewView.onDidDispose(() => editorListener.dispose());
 
         webviewView.webview.onDidReceiveMessage(async (message) => {
             if (message.command === 'startRecording') {
@@ -148,6 +165,8 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
                 webviewView.webview.postMessage({ command: 'actionDone', id: message.id });
             } else if (message.command === 'rejectAction') {
                 webviewView.webview.postMessage({ command: 'actionDone', id: message.id });
+            } else if (message.command === 'cancelPolling') {
+                pollingAborted = true;
             }
         });
     }
@@ -225,9 +244,11 @@ async function executeAgenticAction(intent: string, content: string, agenticFile
 
 async function handleRecording(webview: vscode.Webview, seconds: number) {
     const userId = getUserId();
+    pollingAborted = false;
     try {
         webview.postMessage({ command: 'status', text: 'Recording for ' + seconds + 's... Speak now!' });
         const audioBase64 = await recordAudioWithPython(seconds);
+        if (pollingAborted) { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); return; }
         const codeContext = getActiveFileContent();
         const workspaceContext = await getWorkspaceContent();
         webview.postMessage({ command: 'status', text: 'Transcribing your voice...' });
@@ -236,12 +257,19 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         if (workspaceContext) { body.code_context = workspaceContext; }
         else if (codeContext) { body.code_context = codeContext; }
         if (activeEditor) { body.active_filename = path.basename(activeEditor.document.fileName); }
-        const triggerRaw = await httpsPost(API_BASE + '/voice', JSON.stringify(body));
+        // Trim context if payload is too large for Lambda async invoke (256KB limit)
+        let bodyStr = JSON.stringify(body);
+        if (bodyStr.length > 200000 && body.code_context) {
+            body.code_context = body.code_context.substring(0, Math.max(1000, body.code_context.length - (bodyStr.length - 200000) - 200));
+            bodyStr = JSON.stringify(body);
+        }
+        const triggerRaw = await httpsPost(API_BASE + '/voice', bodyStr);
         const triggerData = JSON.parse(triggerRaw) as { job_id?: string; error?: string };
         if (!triggerData.job_id) { webview.postMessage({ command: 'error', text: triggerData.error || 'Failed to start job' }); return; }
         webview.postMessage({ command: 'status', text: 'Processing with Dev-Saarathi AI...' });
         for (let i = 0; i < 60; i++) {
             await sleep(3000);
+            if (pollingAborted) { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); return; }
             const resultRaw = await httpsGet(API_BASE + '/result/' + triggerData.job_id);
             const resultData = JSON.parse(resultRaw) as {
                 status: string;
@@ -278,6 +306,8 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
         const msg = String(err);
         if (msg.includes('SILENCE')) {
             webview.postMessage({ command: 'error', text: '🤫 No audio detected — please speak clearly and try again!' });
+        } else if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network|socket hang up/i.test(msg)) {
+            webview.postMessage({ command: 'error', text: '🔌 Backend unavailable — check your internet connection and try again.' });
         } else {
             webview.postMessage({ command: 'error', text: msg });
         }
@@ -300,6 +330,7 @@ function getWebviewContent(): string {
         '<head>',
         '<meta charset="UTF-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src https://fonts.gstatic.com; script-src \'unsafe-inline\' https://cdnjs.cloudflare.com; img-src data:;">',
         '<title>Dev-Saarathi</title>',
         "<style>@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap');</style>",
         '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>',
@@ -333,6 +364,7 @@ function getWebviewContent(): string {
         '  </div>',
         '  <div class="countdown" id="countdown"></div>',
         '  <button class="mic-btn" id="micBtn" onclick="startRecording()">&#127908; Speak Now</button>',
+        '  <button class="cancel-btn" id="cancelBtn" onclick="cancelPolling()" style="display:none;">✕ Cancel</button>',
         '  <div class="hint">Speak in Hindi, Tamil, Telugu, Kannada &amp; more</div>',
         '</div>',
         '<script>' + js + '</' + 'script>',
@@ -405,6 +437,8 @@ function buildCSS(): string {
         '.mic-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }',
         '.mic-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }',
         '.hint { font-size: 9px; color: var(--muted); text-align: center; letter-spacing: 0.5px; }',
+        '.cancel-btn { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(253,121,168,0.3); background: rgba(253,121,168,0.1); color: var(--dosh); font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; }',
+        '.cancel-btn:hover { background: rgba(253,121,168,0.25); }',
         '.countdown { font-size: 11px; color: var(--accent); text-align: center; font-family: "JetBrains Mono", monospace; display: none; }',
         '.ctx-bar { font-size: 9px; color: var(--muted); padding: 4px 8px; background: rgba(78,205,196,0.05); border: 1px solid rgba(78,205,196,0.1); border-radius: 4px; display: none; align-items: center; gap: 5px; }',
         '.ctx-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--vaani); flex-shrink: 0; }',
@@ -420,7 +454,9 @@ function buildJS(): string {
         'var pendingActions = {};',
         '',
         'var markedRenderer = new marked.Renderer();',
-        'markedRenderer.code = function(code, lang) {',
+        'markedRenderer.code = function(obj) {',
+        '  var code = typeof obj === "string" ? obj : (obj.text || "");',
+        '  var lang = typeof obj === "string" ? arguments[1] : (obj.lang || "");',
         '  var language = (lang && hljs.getLanguage(lang)) ? lang : "plaintext";',
         '  var highlighted = hljs.highlight(code, { language: language }).value;',
         '  var langLabel = lang ? "<span class=\\"code-lang\\">"+lang+"</span>" : "";',
@@ -466,6 +502,7 @@ function buildJS(): string {
         '    }',
         '  }, 1000);',
         '  vscode.postMessage({ command: "startRecording", seconds: selectedDuration });',
+        '  document.getElementById("cancelBtn").style.display = "block";',
         '}',
         '',
         'function resetBtn() {',
@@ -474,6 +511,12 @@ function buildJS(): string {
         '  btn.textContent = "\\uD83C\\uDF99 Speak Now";',
         '  clearInterval(countdownInterval);',
         '  document.getElementById("countdown").style.display = "none";',
+        '  document.getElementById("cancelBtn").style.display = "none";',
+        '}',
+        '',
+        'function cancelPolling() {',
+        '  vscode.postMessage({ command: "cancelPolling" });',
+        '  resetBtn();',
         '}',
         '',
         'function hideWelcome() {',
@@ -505,8 +548,9 @@ function buildJS(): string {
         '',
         // ── CHANGE 3: getActionLabel now uses agenticFile directly instead of content-sniffing ──
         'function getActionLabel(intent, content, agenticFile) {',
-        '  if (intent === "VAANI") { var fname = agenticFile || "file"; return fname.indexOf(".") > 0 ? "\\u270f\\ufe0f Save to " + fname + "?" : "\\u270f\\ufe0f Write changes to file?"; }',
-        '  if (intent === "DOSH") { var fname = agenticFile || "file"; return "\\uD83D\\uDD27 Apply fix to " + fname + "?"; }',
+        '  var fname = agenticFile || "file";',
+        '  if (intent === "VAANI") { return fname.indexOf(".") > 0 ? "\u270f\ufe0f Save to " + fname + "?" : "\u270f\ufe0f Write changes to file?"; }',
+        '  if (intent === "DOSH") { return "\uD83D\uDD27 Apply fix to " + fname + "?"; }',
         '  if (agenticFile === "__GIT__") { return "\\uD83D\\uDE80 Open git commands in terminal?"; }',
         '  if (agenticFile === "README.md") { return "\\uD83D\\uDCC4 Create README.md in workspace?"; }',
         '  if (agenticFile && agenticFile.indexOf("test") === 0) { return "\\uD83E\\uDDEA Create " + agenticFile + " in workspace?"; }',
