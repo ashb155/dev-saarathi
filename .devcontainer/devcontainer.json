@@ -6,11 +6,13 @@
       "version": "3.11"
     }
   },
-  "postCreateCommand": "npm install && npm run compile && npx @vscode/vsce package --no-dependencies -o dev-saarathi.vsix && code --install-extension dev-saarathi.vsix --force 2>/dev/null || true",
+  "postCreateCommand": "npm install && npm run compile && npx @vscode/vsce package --no-dependencies -o dev-saarathi.vsix",
+  "postAttachCommand": "code --install-extension dev-saarathi.vsix --force 2>/dev/null; echo '✅ Dev-Saarathi installed! Press F5 to launch, then click the 🤖 robot icon in the sidebar.'",
   "customizations": {
     "vscode": {
       "settings": {
-        "workbench.colorTheme": "Default Dark Modern"
+        "workbench.colorTheme": "Default Dark Modern",
+        "workbench.startupEditor": "readme"
       },
       "extensions": []
     }
