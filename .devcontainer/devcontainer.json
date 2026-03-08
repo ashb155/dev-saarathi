@@ -1,0 +1,19 @@
+{
+  "name": "Dev-Saarathi",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:20",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+  "postCreateCommand": "npm install && npm run compile && npx @vscode/vsce package --no-dependencies -o dev-saarathi.vsix && code --install-extension dev-saarathi.vsix --force 2>/dev/null || true",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "workbench.colorTheme": "Default Dark Modern"
+      },
+      "extensions": []
+    }
+  },
+  "forwardPorts": []
+}
