@@ -7,6 +7,8 @@ import * as os from 'os';
 
 const API_BASE = 'https://q2eaht6bo7.execute-api.ap-south-1.amazonaws.com/prod';
 let pollingAborted = false;
+let browserAudioResolve: ((audio: string) => void) | null = null;
+let browserAudioReject: ((err: Error) => void) | null = null;
 
 function getUserId(): string {
     return `vscode-${vscode.env.machineId.substring(0, 16)}`;
@@ -83,6 +85,14 @@ async function recordAudioWithPython(seconds: number): Promise<string> {
             else if (code === 0 && output.trim()) { resolve(output.trim()); }
             else { reject(new Error(error || 'Recording failed')); }
         });
+    });
+}
+
+function waitForBrowserAudio(webview: vscode.Webview, seconds: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+        browserAudioResolve = resolve;
+        browserAudioReject = reject;
+        webview.postMessage({ command: 'recordAudioBrowser', seconds: seconds });
     });
 }
 
@@ -182,6 +192,18 @@ class DevSaarathiViewProvider implements vscode.WebviewViewProvider {
                 webviewView.webview.postMessage({ command: 'actionDone', id: message.id });
             } else if (message.command === 'cancelPolling') {
                 pollingAborted = true;
+            } else if (message.command === 'browserAudioResult') {
+                if (browserAudioResolve) {
+                    browserAudioResolve(message.audio);
+                    browserAudioResolve = null;
+                    browserAudioReject = null;
+                }
+            } else if (message.command === 'browserAudioError') {
+                if (browserAudioReject) {
+                    browserAudioReject(new Error(message.error || 'Browser recording failed'));
+                    browserAudioResolve = null;
+                    browserAudioReject = null;
+                }
             }
         });
     }
@@ -292,7 +314,15 @@ async function handleRecording(webview: vscode.Webview, seconds: number) {
     pollingAborted = false;
     try {
         webview.postMessage({ command: 'status', text: 'Recording for ' + seconds + 's... Speak now!' });
-        const audioBase64 = await recordAudioWithPython(seconds);
+        let audioBase64: string;
+        try {
+            audioBase64 = await recordAudioWithPython(seconds);
+        } catch (recErr) {
+            if (String(recErr).includes('SILENCE')) { throw recErr; }
+            // Python recording failed (Codespaces, no audio device, etc.)
+            webview.postMessage({ command: 'status', text: '🎤 Recording via browser mic for ' + seconds + 's...' });
+            audioBase64 = await waitForBrowserAudio(webview, seconds);
+        }
         if (pollingAborted) { webview.postMessage({ command: 'error', text: 'Request cancelled.' }); return; }
         const codeContext = getActiveFileContent();
         const workspaceContext = await getWorkspaceContent();
@@ -571,6 +601,53 @@ function buildJS(): string {
         '  resetBtn();',
         '}',
         '',
+        '// ── Browser Audio Recording (fallback for Codespaces) ──',
+        'function _writeStr(v,o,s){for(var i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}',
+        'function _downsample(buf,from,to){',
+        '  if(from===to)return buf;var r=from/to,n=Math.round(buf.length/r),out=new Float32Array(n);',
+        '  for(var i=0;i<n;i++){var s=i*r,idx=Math.floor(s),f=s-idx;out[i]=buf[idx]*(1-f)+(buf[idx+1]||0)*f;}return out;',
+        '}',
+        'function _encodeWAV(samples,sr){',
+        '  var n=samples.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);',
+        '  _writeStr(v,0,"RIFF");v.setUint32(4,36+n*2,true);_writeStr(v,8,"WAVE");',
+        '  _writeStr(v,12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);',
+        '  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);',
+        '  _writeStr(v,36,"data");v.setUint32(40,n*2,true);',
+        '  for(var i=0;i<n;i++){var s=Math.max(-1,Math.min(1,samples[i]));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true);}',
+        '  return buf;',
+        '}',
+        'function _toB64(buf){var b=new Uint8Array(buf),s="",c=8192;for(var i=0;i<b.length;i+=c)s+=String.fromCharCode.apply(null,b.subarray(i,i+c));return btoa(s);}',
+        '',
+        'async function recordAudioInBrowser(seconds){',
+        '  try{',
+        '    var stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});',
+        '    var ctx=new(window.AudioContext||window.webkitAudioContext)();',
+        '    var src=ctx.createMediaStreamSource(stream);',
+        '    var nativeSR=ctx.sampleRate;',
+        '    var proc=ctx.createScriptProcessor(4096,1,1);',
+        '    var chunks=[];',
+        '    proc.onaudioprocess=function(e){chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));};',
+        '    src.connect(proc);proc.connect(ctx.destination);',
+        '    await new Promise(function(r){setTimeout(r,seconds*1000);});',
+        '    proc.disconnect();src.disconnect();stream.getTracks().forEach(function(t){t.stop();});',
+        '    await ctx.close();',
+        '    var total=chunks.reduce(function(s,c){return s+c.length;},0);',
+        '    var pcm=new Float32Array(total);var off=0;',
+        '    for(var i=0;i<chunks.length;i++){pcm.set(chunks[i],off);off+=chunks[i].length;}',
+        '    var sumSq=0;for(var j=0;j<pcm.length;j++)sumSq+=pcm[j]*pcm[j];',
+        '    if(Math.sqrt(sumSq/pcm.length)<0.003){',
+        '      vscode.postMessage({command:"browserAudioError",error:"SILENCE"});return;',
+        '    }',
+        '    var gained=new Float32Array(pcm.length);',
+        '    for(var k=0;k<pcm.length;k++)gained[k]=Math.max(-1,Math.min(1,pcm[k]*4));',
+        '    var ds=_downsample(gained,nativeSR,16000);',
+        '    var wav=_encodeWAV(ds,16000);',
+        '    vscode.postMessage({command:"browserAudioResult",audio:_toB64(wav)});',
+        '  }catch(err){',
+        '    vscode.postMessage({command:"browserAudioError",error:err.message||"Mic access denied"});',
+        '  }',
+        '}',
+        '',
         'function hideWelcome() {',
         '  var w = document.getElementById("welcome");',
         '  if (w) { w.remove(); }',
@@ -700,6 +777,8 @@ function buildJS(): string {
         '        addResponse({ query: item.query, response: item.response, intent: item.intent, detected_lang: item.detected_lang, agentic: false });',
         '      });',
         '    }',
+        '  } else if (msg.command === "recordAudioBrowser") {',
+        '    recordAudioInBrowser(msg.seconds);',
         '  }',
         '});',
         '',
