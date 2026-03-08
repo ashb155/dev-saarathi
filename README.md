@@ -1,71 +1,111 @@
-# dev-saarathi README
+# Dev-Saarathi — AI Bridge for India's Developers
 
-This is the README for your extension "dev-saarathi". After writing up a brief description, we recommend including the following sections.
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ashb155/dev-saarathi?quickstart=1)
 
-## Features
+**Dev-Saarathi** is a VS Code extension that lets developers ask coding questions and get AI-powered answers in **11 Indian languages** — by voice or text. It bridges the gap between English-dominated developer tools and India's multilingual developer community.
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+## Key Features
 
-For example if there is an image subfolder under your extension project workspace:
+| Feature | Description |
+|---------|-------------|
+| **GYAAN Mode** | Type a question in any Indian language → get an AI answer with code |
+| **VAANI Mode** | Press the mic button → speak in your language → get a spoken + written answer |
+| **11 Languages** | Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, English |
+| **Context-Aware** | Automatically includes your active file, diagnostics, and workspace info |
+| **Agentic Actions** | One-click "Apply Code" inserts generated code directly into your editor |
+| **Smart Polling** | Exponential backoff (3s → 5s → 8s) for responsive results without overloading |
+| **Browser Mic Fallback** | Works in GitHub Codespaces / vscode.dev via Web Audio API when Python isn't available |
 
-\!\[feature X\]\(images/feature-x.png\)
+## Architecture
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+```
+┌─────────────────────┐     REST API      ┌─────────────────────────────┐
+│  VS Code Extension  │ ◄──────────────► │  API Gateway (ap-south-1)   │
+│  (TypeScript)       │                   │                             │
+│                     │                   │  /trigger   → Lambda        │
+│  Webview Chat Panel │                   │  /result    → Lambda        │
+│  + Voice Recording  │                   │  /history   → Lambda        │
+└─────────────────────┘                   └──────────┬──────────────────┘
+                                                     │
+                                          ┌──────────▼──────────────────┐
+                                          │  Lambda Processor           │
+                                          │  • Amazon Transcribe (STT)  │
+                                          │  • Bedrock Nova Pro (LLM)   │
+                                          │  • Knowledge Base (RAG)     │
+                                          │  • Guardrails (safety)      │
+                                          │  • S3 (audio storage)       │
+                                          │  • DynamoDB (jobs, users)   │
+                                          └─────────────────────────────┘
+```
 
-## Requirements
+## Quick Start
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+### Option 1: GitHub Codespaces (Recommended for evaluators)
 
-## Extension Settings
+1. Click the **"Open in GitHub Codespaces"** badge above
+2. Wait for the container to build (~2 min) — it auto-installs dependencies, compiles, and packages the VSIX
+3. Press **F5** to launch the Extension Development Host
+4. Open the **Dev-Saarathi** panel from the Activity Bar (robot icon)
+5. Type in Hindi/Tamil/etc. or click the mic button
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+### Option 2: Local Development
 
-For example:
+```bash
+git clone https://github.com/ashb155/dev-saarathi.git
+cd dev-saarathi
+npm install
+npm run compile
+```
 
-This extension contributes the following settings:
+Then press **F5** in VS Code to launch the Extension Development Host.
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+**Voice recording** (VAANI) requires Python 3 with `sounddevice` and `numpy`:
+```bash
+pip install sounddevice numpy
+```
 
-## Known Issues
+## Usage
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+1. Open the **Dev-Saarathi** panel from the Activity Bar
+2. **Text (GYAAN):** Type your question in any supported language and press Enter
+3. **Voice (VAANI):** Click 🎤, speak for up to 15 seconds, click ⏹ to stop
+4. View the AI response with syntax-highlighted code blocks
+5. Click **"Apply Code"** to insert generated code into your active editor
 
-## Release Notes
+## Backend (ds_arch)
 
-Users appreciate release notes as you update your extension.
+The serverless backend lives in a separate repo: [ashb155/ds_arch](https://github.com/ashb155/ds_arch)
 
-### 1.0.0
+| Lambda | Purpose |
+|--------|---------|
+| `lambda_trigger` | Receives request, uploads audio to S3, creates DynamoDB job, invokes processor async |
+| `lambda_processor` | Transcribes audio (Transcribe), detects intent, queries Knowledge Base (RAG), generates response (Bedrock Nova Pro/Lite) |
+| `lambda_result` | Returns job status/result and user history |
+| `lambda_scraper` | Scrapes documentation for knowledge base ingestion |
+| `lambda_ingestion` | Ingests scraped content into Bedrock Knowledge Base |
 
-Initial release of ...
+## Tech Stack
 
-### 1.0.1
+- **Frontend:** TypeScript, VS Code Webview API, Web Audio API
+- **Backend:** Python 3.11, AWS Lambda, API Gateway
+- **AI/ML:** Amazon Bedrock (Nova Pro + Lite), Amazon Transcribe, Bedrock Knowledge Base, Bedrock Guardrails
+- **Storage:** Amazon S3, Amazon DynamoDB
+- **Region:** ap-south-1 (Mumbai)
 
-Fixed issue #.
+## Project Structure
 
-### 1.1.0
+```
+dev-saarathi/
+├── src/
+│   └── extension.ts          # Main extension (~750 lines)
+├── .devcontainer/
+│   └── devcontainer.json     # Codespaces config
+├── package.json              # Extension manifest
+├── tsconfig.json             # TypeScript config
+├── esbuild.js                # Bundle config
+└── CHANGELOG.md
+```
 
-Added features X, Y, and Z.
+## License
 
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+MIT
