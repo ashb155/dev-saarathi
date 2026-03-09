@@ -10,6 +10,8 @@ def format_result(result):
         return int(result)
     return round(result, 6)
 
-def history_log(operation, result, history=[]):
+def history_log(operation, result, history=None):
+    if history is None:
+        history = []
     history.append(f"{operation} = {result}")
     return history
